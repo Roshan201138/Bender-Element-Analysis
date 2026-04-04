@@ -1,0 +1,30 @@
+cff-version: 1.2.0
+title: "Bender Element Signal Interpretation App"
+message: "If you use this software, please cite it as follows."
+type: software
+
+authors:
+  - family-names: Roshan
+    given-names: Mohammad Jawed
+    affiliation: University of Minho, Portugal
+  - family-names: Correia
+    given-names: António Gomes
+    affiliation: University of Minho, Portugal
+  - family-names: Moldovan
+    given-names: Ionut Dragos
+    affiliation: University of Minho, Portugal
+  - family-names: Azenha
+    given-names: Miguel
+    affiliation: University of Minho, Portugal
+
+keywords:
+  - geotechnical engineering
+  - bender element
+  - shear wave velocity
+  - Gmax
+  - signal processing
+
+license: "MIT"
+
+version: "1.0.0"
+date-released: 2026-01-06
