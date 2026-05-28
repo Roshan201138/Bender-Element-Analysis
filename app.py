@@ -272,6 +272,7 @@ def peak_to_peak_method(
     search_delay_s: float,
     search_end_s: Optional[float],
     prominence_ratio: float,
+    selected_output_peak_time_s: Optional[float] = None,
 ) -> Tuple[Optional[float], Optional[float], str, PeakToPeakDetails]:
     input_signal = np.asarray(input_signal, dtype=float)
     output_signal = np.asarray(output_signal, dtype=float)
@@ -302,7 +303,18 @@ def peak_to_peak_method(
     if not np.isfinite(output_peak) or output_peak <= 0:
         return tx_peak_time_s, None, "A positive output peak could not be identified.", PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
 
-    rx_local_idx = int(np.argmax(s_out))
+    if selected_output_peak_time_s is not None:
+        # Use the user-selected received/output peak. The nearest available sample
+        # is used so the selected value remains valid even if the sampling interval
+        # prevents an exact time match.
+        if selected_output_peak_time_s < t_out[0] or selected_output_peak_time_s > t_out[-1]:
+            return tx_peak_time_s, None, "The selected output peak is outside the peak-to-peak search window.", PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
+        rx_local_idx = int(np.argmin(np.abs(t_out - selected_output_peak_time_s)))
+        note = "Travel time is measured from the transmitted positive peak time to the user-selected received/output peak."
+    else:
+        rx_local_idx = int(np.argmax(s_out))
+        note = "Travel time is measured from the transmitted positive peak time to the highest positive point of the received signal within the search window."
+
     rx_peak_time_s = float(t_out[rx_local_idx])
     rx_peak_value = float(s_out[rx_local_idx])
 
@@ -310,7 +322,118 @@ def peak_to_peak_method(
         return tx_peak_time_s, None, "Peak-to-peak travel time is not positive.", PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
 
     details = PeakToPeakDetails(tx_peak_time_s, rx_peak_time_s, tx_peak_value, rx_peak_value)
-    return tx_peak_time_s, rx_peak_time_s, "Travel time is measured from the transmitted positive peak time to the highest positive point of the received signal within the search window.", details
+    return tx_peak_time_s, rx_peak_time_s, note, details
+
+
+def get_peak_to_peak_candidates(
+    file_obj,
+    time_col: str,
+    input_col: str,
+    output_col: str,
+    time_unit: str,
+    prominence_ratio: float = 0.15,
+    search_delay_s: float = 0.05e-3,
+    search_end_s: Optional[float] = 3.0e-3,
+) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, PeakToPeakDetails]:
+    """Return candidate received/output peaks for manual peak-to-peak selection.
+
+    The transmitted/input peak is detected first. Then all positive received/output
+    peaks inside the same interpretation window are listed so the user can select
+    the physically correct first arrival peak when it is not the maximum peak.
+    """
+    df, _ = load_be_file(file_obj)
+    time_raw = df[time_col].to_numpy(dtype=float)
+    input_raw = df[input_col].to_numpy(dtype=float)
+    output_raw = df[output_col].to_numpy(dtype=float)
+
+    valid_mask = np.isfinite(time_raw) & np.isfinite(input_raw) & np.isfinite(output_raw)
+    time_raw = time_raw[valid_mask]
+    input_raw = input_raw[valid_mask]
+    output_raw = output_raw[valid_mask]
+
+    time_s, _ = get_sampling_info(time_raw, time_unit)
+    input_processed = input_raw - np.nanmean(input_raw)
+    output_processed = output_raw - np.nanmean(output_raw)
+
+    reference_time_s = estimate_reference_time(time_s, input_processed, threshold_ratio=0.10)
+
+    input_peak = float(np.nanmax(input_processed))
+    input_peaks, _ = find_peaks(input_processed, prominence=prominence_ratio * input_peak)
+    if len(input_peaks) == 0:
+        tx_idx = int(np.argmax(input_processed))
+    else:
+        valid_input_peaks = input_peaks[time_s[input_peaks] >= reference_time_s]
+        tx_idx = int(valid_input_peaks[0]) if len(valid_input_peaks) > 0 else int(input_peaks[np.argmax(input_processed[input_peaks])])
+
+    tx_peak_time_s = float(time_s[tx_idx])
+    tx_peak_value = float(input_processed[tx_idx])
+
+    start_time_s = tx_peak_time_s + search_delay_s
+    mask = (time_s >= start_time_s) if search_end_s is None else ((time_s >= start_time_s) & (time_s <= search_end_s))
+    t_out = time_s[mask]
+    s_out = output_processed[mask]
+
+    if len(t_out) < 5:
+        empty = pd.DataFrame(columns=["Peak number", "Time (ms)", "Amplitude", "Candidate label"])
+        return empty, time_s, input_processed, output_processed, PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
+
+    positive_peak = float(np.nanmax(s_out))
+    if not np.isfinite(positive_peak) or positive_peak <= 0:
+        empty = pd.DataFrame(columns=["Peak number", "Time (ms)", "Amplitude", "Candidate label"])
+        return empty, time_s, input_processed, output_processed, PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
+
+    output_peaks_local, _ = find_peaks(s_out, prominence=prominence_ratio * positive_peak)
+    output_peaks_local = [idx for idx in output_peaks_local if s_out[idx] > 0]
+
+    if len(output_peaks_local) == 0:
+        output_peaks_local = [int(np.argmax(s_out))]
+
+    rows = []
+    max_local_idx = int(np.argmax(s_out))
+    first_peak_time_s = float(t_out[output_peaks_local[0]])
+    max_peak_time_s = float(t_out[max_local_idx])
+
+    for number, local_idx in enumerate(output_peaks_local, start=1):
+        peak_time_s = float(t_out[local_idx])
+        labels = []
+        if np.isclose(peak_time_s, first_peak_time_s):
+            labels.append("first detected positive peak")
+        if np.isclose(peak_time_s, max_peak_time_s):
+            labels.append("maximum positive peak")
+        rows.append({
+            "Peak number": number,
+            "Time (ms)": peak_time_s * 1e3,
+            "Amplitude": float(s_out[local_idx]),
+            "Candidate label": "; ".join(labels) if labels else "candidate positive peak",
+        })
+
+    candidates_df = pd.DataFrame(rows)
+    details = PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
+    return candidates_df, time_s, input_processed, output_processed, details
+
+
+def make_peak_candidate_plot(
+    time_s: np.ndarray,
+    input_signal: np.ndarray,
+    output_signal: np.ndarray,
+    input_details: PeakToPeakDetails,
+    candidates_df: pd.DataFrame,
+    zoom_end_ms: float = 3.0,
+):
+    fig = make_peak_to_peak_plot(time_s, input_signal, output_signal, input_details, zoom_end_ms)
+    ax1 = fig.axes[0]
+    ax2 = fig.axes[1]
+
+    for _, row in candidates_df.iterrows():
+        t_ms = float(row["Time (ms)"])
+        amp = float(row["Amplitude"])
+        number = int(row["Peak number"])
+        ax2.plot(t_ms, amp, marker="s", linestyle="None", markersize=6, color="black", zorder=6)
+        ax2.annotate(str(number), xy=(t_ms, amp), xytext=(4, 4), textcoords="offset points", fontsize=9, color="black")
+
+    ax1.set_title("Candidate received/output peaks for manual peak-to-peak selection")
+    fig.tight_layout()
+    return fig
 
 
 
@@ -598,6 +721,7 @@ def analyze_file(
     time_unit: str,
     travel_length_mm: float,
     density_kg_m3: float,
+    selected_output_peak_time_s: Optional[float] = None,
 ) -> FileAnalysisOutput:
     df, _ = load_be_file(file_obj)
     if df.empty:
@@ -636,6 +760,7 @@ def analyze_file(
         search_delay_s,
         search_end_s,
         peak_prominence_ratio,
+        selected_output_peak_time_s=selected_output_peak_time_s,
     )
     results["Peak-to-peak"] = calculate_vs_and_gmax(
         rx_peak_time_s,
@@ -749,6 +874,60 @@ with meta1:
 with meta2:
     density_kg_m3 = st.number_input("Bulk density ρ (kg/m³)", min_value=0.001, value=2000.0, step=10.0, format="%.3f")
 
+selected_output_peak_time_s = None
+manual_peak_candidates_df = None
+
+if analysis_mode == "Single file":
+    st.subheader("Peak-to-peak output peak selection")
+    p2p_selection_mode = st.radio(
+        "Received/output peak used for the peak-to-peak method",
+        options=["Automatic: highest positive output peak", "Manual: select the output peak from candidates"],
+        horizontal=False,
+    )
+
+    if p2p_selection_mode.startswith("Manual"):
+        try:
+            (
+                manual_peak_candidates_df,
+                candidate_time_s,
+                candidate_input_signal,
+                candidate_output_signal,
+                candidate_input_details,
+            ) = get_peak_to_peak_candidates(
+                uploaded_file,
+                time_col,
+                input_col,
+                output_col,
+                time_unit,
+            )
+
+            if manual_peak_candidates_df.empty:
+                st.warning("No candidate positive output peaks were detected in the current search window. The app will use the automatic interpretation.")
+            else:
+                st.write("Select the received/output peak that represents the first reliable arrival. This avoids using a later maximum peak when the first arrival is smaller.")
+                st.dataframe(manual_peak_candidates_df, use_container_width=True)
+
+                candidate_options = [
+                    f"Peak {int(row['Peak number'])}: {row['Time (ms)']:.6f} ms, amplitude = {row['Amplitude']:.6g} ({row['Candidate label']})"
+                    for _, row in manual_peak_candidates_df.iterrows()
+                ]
+                selected_candidate_label = st.selectbox("Select output peak for peak-to-peak calculation", options=candidate_options)
+                selected_candidate_index = candidate_options.index(selected_candidate_label)
+                selected_output_peak_time_s = float(manual_peak_candidates_df.iloc[selected_candidate_index]["Time (ms)"]) * 1e-3
+
+                fig_candidates = make_peak_candidate_plot(
+                    candidate_time_s,
+                    candidate_input_signal,
+                    candidate_output_signal,
+                    candidate_input_details,
+                    manual_peak_candidates_df,
+                    3.0,
+                )
+                st.pyplot(fig_candidates)
+                plt.close(fig_candidates)
+        except Exception as exc:
+            st.warning(f"Manual peak selection could not be prepared: {exc}")
+
 run_analysis = st.button("Run analysis", type="primary")
 if not run_analysis:
     st.stop()
@@ -769,6 +948,7 @@ for file_obj in file_list:
             time_unit,
             travel_length_mm,
             density_kg_m3,
+            selected_output_peak_time_s=selected_output_peak_time_s if analysis_mode == "Single file" else None,
         )
 
         results_df = analysis_output.results_df.copy()
@@ -918,5 +1098,3 @@ else:
             file_name="bender_element_batch_plots.zip",
             mime="application/zip",
         )
-
-
