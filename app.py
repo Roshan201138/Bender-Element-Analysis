@@ -263,6 +263,49 @@ def crop_window(time_s: np.ndarray, signal: np.ndarray, start_time_s: float, end
     return time_s[mask], signal[mask]
 
 
+def select_output_peak_in_time_window(
+    time_s: np.ndarray,
+    output_signal: np.ndarray,
+    window_start_s: float,
+    window_end_s: float,
+    prominence_ratio: float = 0.05,
+) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Select the strongest positive local received/output peak in the user-defined arrival window.
+    """
+    if window_end_s <= window_start_s:
+        return None, None, "The selected arrival-peak window is invalid."
+
+    mask = (time_s >= window_start_s) & (time_s <= window_end_s)
+    if not np.any(mask):
+        return None, None, "No data exist inside the selected arrival-peak window."
+
+    t_win = time_s[mask]
+    s_win = output_signal[mask]
+
+    if len(t_win) < 3:
+        return None, None, "The selected arrival-peak window is too narrow."
+
+    max_abs = np.nanmax(np.abs(s_win))
+    if not np.isfinite(max_abs) or max_abs == 0:
+        return None, None, "The selected window has no usable output signal."
+
+    peak_indices, _ = find_peaks(s_win, prominence=prominence_ratio * max_abs)
+    peak_indices = np.array(
+        [idx for idx in peak_indices if np.isfinite(s_win[idx]) and s_win[idx] > 0],
+        dtype=int,
+    )
+
+    if len(peak_indices) == 0:
+        if np.nanmax(s_win) <= 0:
+            return None, None, "No positive output peak was found in the selected window."
+        idx = int(np.nanargmax(s_win))
+    else:
+        idx = int(peak_indices[np.nanargmax(s_win[peak_indices])])
+
+    return float(t_win[idx]), float(s_win[idx]), "Manual sliding-window arrival peak selected successfully."
+
+
 def select_arrival_peak_with_sliding_window(
     time_s: np.ndarray,
     output_signal: np.ndarray,
@@ -956,34 +999,59 @@ with meta2:
 manual_peak_window_ms = None
 preview_zoom_end_ms = 3.0
 
+manual_peak_window_ms = None
+preview_zoom_end_ms = 3.0
+
 st.subheader("Peak-to-peak interpretation settings")
-peak_selection_mode = st.radio(
-    "Arrival peak selection for the peak-to-peak method",
-    options=["Automatic", "Manual sliding window"],
+peak_mode = st.radio(
+    "Output peak selection mode",
+    options=["Automatic highest positive peak", "Manual sliding-window selection"],
     horizontal=True,
-    help="Automatic uses the highest positive received/output peak in the default search window. Manual sliding window lets you bracket the expected first arrival peak on the received signal.",
 )
 
-manual_arrival_window_ms = None
-if peak_selection_mode == "Manual sliding window":
-    manual_arrival_window_ms = st.slider(
-        "Locate the sliding window around the potential arrival peak on the received/output signal (ms)",
+if peak_mode == "Manual sliding-window selection":
+    st.info(
+        "First inspect the signal preview below, then adjust the window to cover the potential first-arrival peak "
+        "of the received/output signal. The selected window is shown as the gray shaded region."
+    )
+
+    preview_zoom_end_ms = st.slider(
+        "Preview plot time range (ms)",
+        min_value=0.5,
+        max_value=10.0,
+        value=3.0,
+        step=0.1,
+        help="Increase this value if the received arrival appears after 3 ms.",
+    )
+
+    manual_peak_window_ms = st.slider(
+        "Select arrival-peak window on the received/output signal (ms)",
         min_value=0.0,
-        max_value=3.0,
-        value=(0.20, 1.20),
+        max_value=float(preview_zoom_end_ms),
+        value=(0.20, min(1.50, float(preview_zoom_end_ms))),
         step=0.01,
-        help="Move and resize this window to cover the expected arrival peak. The app will select the strongest positive local peak inside the window.",
-    )
-    st.caption(
-        "Use this option when the first arrival peak is not the maximum peak of the received signal. "
-        "After running the analysis, the selected window is shaded in the peak-to-peak plot."
+        help="The peak-to-peak method will use the strongest positive received/output peak inside this selected window.",
     )
 
-
-if 'manual_peak_window_ms' not in locals():
-    manual_peak_window_ms = None
-if 'preview_zoom_end_ms' not in locals():
-    preview_zoom_end_ms = 3.0
+    try:
+        preview_time_s, preview_input_processed, preview_output_processed = prepare_preview_signals(
+            file_list[0],
+            time_col,
+            input_col,
+            output_col,
+            time_unit,
+        )
+        fig_manual_preview = make_signal_preview_plot(
+            preview_time_s,
+            preview_input_processed,
+            preview_output_processed,
+            window_ms=manual_peak_window_ms,
+            zoom_end_ms=float(preview_zoom_end_ms),
+        )
+        st.pyplot(fig_manual_preview)
+        plt.close(fig_manual_preview)
+    except Exception as exc:
+        st.warning(f"Could not generate the manual-selection preview plot: {exc}")
 
 run_analysis = st.button("Run analysis", type="primary")
 if not run_analysis:
@@ -1024,7 +1092,7 @@ for file_obj in file_list:
             analysis_output.input_processed,
             analysis_output.output_processed,
             analysis_output.peak_details,
-            plot_zoom_end_ms,
+            preview_zoom_end_ms,
             manual_arrival_window_ms=manual_arrival_window_ms,
         )
         plot_files[f"{safe_stem}_peak_to_peak.png"] = fig_to_png_bytes(fig_peak)
@@ -1044,7 +1112,7 @@ if errors:
 if not all_results_tables:
     st.stop()
 
-plot_zoom_end_ms = float(preview_zoom_end_ms) if "preview_zoom_end_ms" in locals() else 3.0
+preview_zoom_end_ms = float(preview_zoom_end_ms) if "preview_zoom_end_ms" in locals() else 3.0
 
 results_table_all = pd.concat(all_results_tables, ignore_index=True)
 
@@ -1074,7 +1142,7 @@ if analysis_mode == "Single file":
             single_output.input_processed,
             single_output.output_processed,
             single_output.peak_details,
-            plot_zoom_end_ms,
+            preview_zoom_end_ms,
             manual_arrival_window_ms=manual_arrival_window_ms,
         )
         st.pyplot(fig_peak_display)
@@ -1101,7 +1169,7 @@ else:
                     analysis_output.input_processed,
                     analysis_output.output_processed,
                     analysis_output.peak_details,
-                    plot_zoom_end_ms,
+                    preview_zoom_end_ms,
                     manual_arrival_window_ms=manual_arrival_window_ms,
                 )
                 st.pyplot(fig_peak_display)
