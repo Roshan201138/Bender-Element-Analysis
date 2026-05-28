@@ -516,6 +516,110 @@ def add_average_gmax_row(results_df: pd.DataFrame) -> pd.DataFrame:
 
 
 
+
+def make_signal_preview_plot(
+    time_s: np.ndarray,
+    input_signal: np.ndarray,
+    output_signal: np.ndarray,
+    window_ms: Optional[Tuple[float, float]] = None,
+    zoom_end_ms: float = 3.0,
+):
+    """
+    Preview the transmitted and received signals before final analysis.
+
+    This plot is shown while the user adjusts the sliding window so that the
+    appropriate arrival peak can be visually bracketed before running the
+    final peak-to-peak calculation.
+    """
+    fig, ax1 = plt.subplots(figsize=(11, 4.8))
+    time_ms = time_s * 1e3
+
+    line_in, = ax1.plot(
+        time_ms,
+        input_signal,
+        linewidth=1.2,
+        color="blue",
+        label="Input signal (V)",
+    )
+    ax1.set_xlabel("Time (ms)")
+    ax1.set_ylabel("Input signal (V)", color="blue")
+    ax1.tick_params(axis="y", labelcolor="blue")
+    ax1.grid(alpha=0.3)
+
+    ax2 = ax1.twinx()
+    line_out, = ax2.plot(
+        time_ms,
+        output_signal,
+        linewidth=1.2,
+        linestyle="--",
+        color="red",
+        label="Output signal (mV)",
+    )
+    ax2.set_ylabel("Output signal (mV)", color="red")
+    ax2.tick_params(axis="y", labelcolor="red")
+
+    if window_ms is not None:
+        ax1.axvspan(
+            window_ms[0],
+            window_ms[1],
+            alpha=0.18,
+            color="gray",
+            label="Selected arrival-peak window",
+        )
+
+    ax1.set_xlim(0.0, zoom_end_ms)
+    ax1.set_title("Signal preview for manual arrival-peak window selection")
+
+    handles = [line_in, line_out]
+    labels = ["Input signal (V)", "Output signal (mV)"]
+    if window_ms is not None:
+        handles.append(plt.Line2D([0], [0], color="gray", linewidth=6, alpha=0.3))
+        labels.append("Selected arrival-peak window")
+    ax1.legend(handles, labels)
+
+    fig.tight_layout()
+    return fig
+
+
+def prepare_preview_signals(
+    file_obj,
+    time_col: str,
+    input_col: str,
+    output_col: str,
+    time_unit: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load and preprocess the selected file only for preview plotting.
+    """
+    current_pos = None
+    try:
+        current_pos = file_obj.tell()
+    except Exception:
+        current_pos = None
+
+    df, _ = load_be_file(file_obj)
+
+    try:
+        file_obj.seek(0)
+    except Exception:
+        pass
+
+    time_raw = df[time_col].to_numpy(dtype=float)
+    input_raw = df[input_col].to_numpy(dtype=float)
+    output_raw = df[output_col].to_numpy(dtype=float)
+
+    valid_mask = np.isfinite(time_raw) & np.isfinite(input_raw) & np.isfinite(output_raw)
+    time_raw = time_raw[valid_mask]
+    input_raw = input_raw[valid_mask]
+    output_raw = output_raw[valid_mask]
+
+    time_s, _ = get_sampling_info(time_raw, time_unit)
+    input_processed = input_raw - np.nanmean(input_raw)
+    output_processed = output_raw - np.nanmean(output_raw)
+
+    return time_s, input_processed, output_processed
+
+
 def make_peak_to_peak_plot(
     time_s: np.ndarray,
     input_signal: np.ndarray,
@@ -910,7 +1014,7 @@ for file_obj in file_list:
             analysis_output.input_processed,
             analysis_output.output_processed,
             analysis_output.peak_details,
-            3.0,
+            float(preview_zoom_end_ms),
             manual_arrival_window_ms=manual_arrival_window_ms,
         )
         plot_files[f"{safe_stem}_peak_to_peak.png"] = fig_to_png_bytes(fig_peak)
@@ -958,7 +1062,7 @@ if analysis_mode == "Single file":
             single_output.input_processed,
             single_output.output_processed,
             single_output.peak_details,
-            3.0,
+            float(preview_zoom_end_ms),
             manual_arrival_window_ms=manual_arrival_window_ms,
         )
         st.pyplot(fig_peak_display)
@@ -985,7 +1089,7 @@ else:
                     analysis_output.input_processed,
                     analysis_output.output_processed,
                     analysis_output.peak_details,
-                    3.0,
+                    float(preview_zoom_end_ms),
                     manual_arrival_window_ms=manual_arrival_window_ms,
                 )
                 st.pyplot(fig_peak_display)
