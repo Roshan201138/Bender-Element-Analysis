@@ -1018,7 +1018,6 @@ for file_obj in file_list:
             analysis_output.output_processed,
             analysis_output.peak_details,
             plot_time_end_ms,
-            manual_arrival_window_ms=manual_arrival_window_ms,
         )
         plot_files[f"{safe_stem}_peak_to_peak.png"] = fig_to_png_bytes(fig_peak)
         plt.close(fig_peak)
@@ -1066,7 +1065,6 @@ if analysis_mode == "Single file":
             single_output.output_processed,
             single_output.peak_details,
             plot_time_end_ms,
-            manual_arrival_window_ms=manual_arrival_window_ms,
         )
         st.pyplot(fig_peak_display)
         peak_plot_bytes = fig_to_png_bytes(fig_peak_display)
@@ -1093,7 +1091,6 @@ else:
                     analysis_output.output_processed,
                     analysis_output.peak_details,
                     plot_time_end_ms,
-                    manual_arrival_window_ms=manual_arrival_window_ms,
                 )
                 st.pyplot(fig_peak_display)
                 plt.close(fig_peak_display)
