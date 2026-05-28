@@ -934,6 +934,7 @@ with meta2:
     density_kg_m3 = st.number_input("Bulk density ρ (kg/m³)", min_value=0.001, value=2000.0, step=10.0, format="%.3f")
 
 manual_arrival_window_ms = None
+manual_arrival_windows_by_file: Dict[str, Optional[Tuple[float, float]]] = {}
 plot_time_end_ms = 3.0
 
 st.subheader("Peak-to-peak interpretation settings")
@@ -945,38 +946,54 @@ peak_selection_mode = st.radio(
 
 if peak_selection_mode == "Manual sliding-window":
     st.info(
-        "Adjust the sliding window to cover the potential arrival peak in the received/output signal. "
-        "The plot updates immediately and shows the selected window as a gray shaded band."
+        "Define the arrival-peak window before running the analysis. "
+        "For multiple files, each file has its own slider and preview plot."
     )
 
-    manual_arrival_window_ms = st.slider(
-        "Select arrival-peak window on the received/output signal (ms)",
-        min_value=0.0,
-        max_value=3.0,
-        value=(0.20, 1.50),
-        step=0.01,
-        help="The peak-to-peak method will use the strongest positive received/output peak inside this selected window.",
-    )
+    for idx, preview_file_obj in enumerate(file_list):
+        file_label = getattr(preview_file_obj, "name", f"uploaded_file_{idx + 1}")
+        default_window = (0.20, 1.50)
 
-    try:
-        preview_time_s, preview_input_processed, preview_output_processed = prepare_preview_signals(
-            file_list[0],
-            time_col,
-            input_col,
-            output_col,
-            time_unit,
-        )
-        fig_preview = make_signal_preview_plot(
-            preview_time_s,
-            preview_input_processed,
-            preview_output_processed,
-            arrival_window_ms=manual_arrival_window_ms,
-            zoom_end_ms=plot_time_end_ms,
-        )
-        st.pyplot(fig_preview)
-        plt.close(fig_preview)
-    except Exception as exc:
-        st.warning(f"Could not generate the manual-selection signal preview: {exc}")
+        if analysis_mode == "Multiple files":
+            container_label = f"Arrival-window selection for {file_label}"
+        else:
+            container_label = "Arrival-window selection"
+
+        with st.expander(container_label, expanded=(idx == 0)):
+            manual_arrival_windows_by_file[file_label] = st.slider(
+                f"Select arrival-peak window on the received/output signal (ms) — {file_label}",
+                min_value=0.0,
+                max_value=3.0,
+                value=default_window,
+                step=0.01,
+                key=f"manual_arrival_window_{idx}",
+                help="The peak-to-peak method will use the strongest positive received/output peak inside this selected window.",
+            )
+
+            try:
+                preview_time_s, preview_input_processed, preview_output_processed = prepare_preview_signals(
+                    preview_file_obj,
+                    time_col,
+                    input_col,
+                    output_col,
+                    time_unit,
+                )
+                fig_preview = make_signal_preview_plot(
+                    preview_time_s,
+                    preview_input_processed,
+                    preview_output_processed,
+                    arrival_window_ms=manual_arrival_windows_by_file[file_label],
+                    zoom_end_ms=plot_time_end_ms,
+                )
+                st.pyplot(fig_preview)
+                plt.close(fig_preview)
+            except Exception as exc:
+                st.warning(f"Could not generate the manual-selection signal preview for {file_label}: {exc}")
+
+else:
+    for idx, preview_file_obj in enumerate(file_list):
+        file_label = getattr(preview_file_obj, "name", f"uploaded_file_{idx + 1}")
+        manual_arrival_windows_by_file[file_label] = None
 
 run_analysis = st.button("Run analysis", type="primary")
 if not run_analysis:
@@ -990,6 +1007,9 @@ errors: List[str] = []
 
 for file_obj in file_list:
     try:
+        file_label = getattr(file_obj, "name", "uploaded_file")
+        selected_arrival_window_ms = manual_arrival_windows_by_file.get(file_label)
+
         analysis_output = analyze_file(
             file_obj,
             time_col,
@@ -998,7 +1018,7 @@ for file_obj in file_list:
             time_unit,
             travel_length_mm,
             density_kg_m3,
-            manual_arrival_window_ms=manual_arrival_window_ms,
+            manual_arrival_window_ms=selected_arrival_window_ms,
         )
 
         results_df = analysis_output.results_df.copy()
