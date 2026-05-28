@@ -273,6 +273,49 @@ def crop_window(time_s: np.ndarray, signal: np.ndarray, start_time_s: float, end
     return time_s[mask], signal[mask]
 
 
+def select_output_peak_in_time_window(
+    time_s: np.ndarray,
+    output_signal: np.ndarray,
+    window_start_s: float,
+    window_end_s: float,
+    prominence_ratio: float = 0.05,
+) -> Tuple[Optional[float], Optional[float], str]:
+    """
+    Select the strongest positive received/output peak within a user-defined time window.
+    """
+    if window_end_s <= window_start_s:
+        return None, None, "The selected output-peak window is invalid."
+
+    mask = (time_s >= window_start_s) & (time_s <= window_end_s)
+    if not np.any(mask):
+        return None, None, "No data exist inside the selected output-peak window."
+
+    t_win = time_s[mask]
+    s_win = output_signal[mask]
+
+    if len(t_win) < 3:
+        return None, None, "The selected output-peak window is too narrow."
+
+    max_abs = np.nanmax(np.abs(s_win))
+    if not np.isfinite(max_abs) or max_abs == 0:
+        return None, None, "The selected window has no usable output signal."
+
+    peak_indices, _ = find_peaks(s_win, prominence=prominence_ratio * max_abs)
+    peak_indices = np.array(
+        [idx for idx in peak_indices if np.isfinite(s_win[idx]) and s_win[idx] > 0],
+        dtype=int,
+    )
+
+    if len(peak_indices) == 0:
+        if np.nanmax(s_win) <= 0:
+            return None, None, "No positive output peak was found in the selected window."
+        idx = int(np.nanargmax(s_win))
+    else:
+        idx = int(peak_indices[np.nanargmax(s_win[peak_indices])])
+
+    return float(t_win[idx]), float(s_win[idx]), "Manual sliding-window peak selected successfully."
+
+
 
 def peak_to_peak_method(
     time_s: np.ndarray,
@@ -580,8 +623,8 @@ def make_interactive_peak_selection_plot(
     fig.update_layout(
         title="Click on the received/output peak to use for peak-to-peak interpretation",
         xaxis=dict(title="Time (ms)", range=[start_ms, zoom_end_ms]),
-        yaxis=dict(title="Input signal (V)", titlefont=dict(color="blue"), tickfont=dict(color="blue")),
-        yaxis2=dict(title="Output signal (mV)", titlefont=dict(color="red"), tickfont=dict(color="red"), overlaying="y", side="right"),
+        yaxis=dict(title=dict(text="Input signal (V)", font=dict(color="blue")), tickfont=dict(color="blue")),
+        yaxis2=dict(title=dict(text="Output signal (mV)", font=dict(color="red")), tickfont=dict(color="red"), overlaying="y", side="right"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
         height=520,
         margin=dict(l=40, r=40, t=90, b=50),
@@ -721,6 +764,7 @@ def make_peak_to_peak_plot(
     output_signal: np.ndarray,
     details: PeakToPeakDetails,
     zoom_end_ms: float,
+    manual_peak_window_ms: Optional[Tuple[float, float]] = None,
 ):
     """
     Plot the peak-to-peak interpretation using dual y-axes.
@@ -796,6 +840,15 @@ def make_peak_to_peak_plot(
     start_ms = 0.0
     if details.input_peak_time_s is not None:
         start_ms = max(0.0, details.input_peak_time_s * 1e3 - 0.2)
+
+    if manual_peak_window_ms is not None:
+        ax1.axvspan(
+            manual_peak_window_ms[0],
+            manual_peak_window_ms[1],
+            alpha=0.15,
+            color="gray",
+            label="Selected output-peak window",
+        )
 
     ax1.set_xlim(start_ms, zoom_end_ms)
     ax1.set_title("Peak-to-peak interpretation")
@@ -1028,6 +1081,28 @@ with meta1:
 with meta2:
     density_kg_m3 = st.number_input("Bulk density ρ (kg/m³)", min_value=0.001, value=2000.0, step=10.0, format="%.3f")
 
+st.subheader("Peak-to-peak interpretation settings")
+peak_mode = st.radio(
+    "Output peak selection mode",
+    options=["Automatic highest positive peak", "Manual sliding-window selection"],
+    horizontal=True,
+)
+
+manual_peak_window_ms = None
+if peak_mode == "Manual sliding-window selection":
+    st.info(
+        "Move the time-window slider to bracket the desired received/output peak. "
+        "The app will select the strongest positive local peak inside this window and use it for Vs and Gmax."
+    )
+    manual_peak_window_ms = st.slider(
+        "Select output-peak search window on the received signal (ms)",
+        min_value=0.0,
+        max_value=3.0,
+        value=(0.20, 1.50),
+        step=0.01,
+        help="The peak-to-peak method will use the highest positive received/output peak inside this selected window.",
+    )
+
 selected_output_peak_time_s = None
 manual_peak_candidates_df = None
 
@@ -1168,6 +1243,7 @@ for file_obj in file_list:
             analysis_output.output_processed,
             analysis_output.peak_details,
             3.0,
+        manual_peak_window_ms=manual_peak_window_ms,
         )
         plot_files[f"{safe_stem}_peak_to_peak.png"] = fig_to_png_bytes(fig_peak)
         plt.close(fig_peak)
@@ -1215,6 +1291,7 @@ if analysis_mode == "Single file":
             single_output.output_processed,
             single_output.peak_details,
             3.0,
+        manual_peak_window_ms=manual_peak_window_ms,
         )
         st.pyplot(fig_peak_display)
         peak_plot_bytes = fig_to_png_bytes(fig_peak_display)
@@ -1241,7 +1318,8 @@ else:
                     analysis_output.output_processed,
                     analysis_output.peak_details,
                     3.0,
-                )
+                manual_peak_window_ms=manual_peak_window_ms,
+        )
                 st.pyplot(fig_peak_display)
                 plt.close(fig_peak_display)
             with batch_col2:
