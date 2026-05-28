@@ -38,6 +38,16 @@ import pandas as pd
 import streamlit as st
 from scipy.signal import correlate, find_peaks
 
+try:
+    import plotly.graph_objects as go
+except Exception:
+    go = None
+
+try:
+    from streamlit_plotly_events import plotly_events
+except Exception:
+    plotly_events = None
+
 
 st.set_page_config(page_title="Bender Element Signal Interpretation App", layout="wide")
 
@@ -433,6 +443,150 @@ def make_peak_candidate_plot(
 
     ax1.set_title("Candidate received/output peaks for manual peak-to-peak selection")
     fig.tight_layout()
+    return fig
+
+
+def snap_clicked_time_to_output_peak(
+    time_s: np.ndarray,
+    output_signal: np.ndarray,
+    clicked_time_ms: float,
+    tx_peak_time_s: Optional[float],
+    search_delay_s: float = 0.05e-3,
+    search_end_s: Optional[float] = 3.0e-3,
+    prominence_ratio: float = 0.15,
+) -> Tuple[float, float, str]:
+    """Snap a mouse click to the nearest positive output peak in the valid search window.
+
+    The user clicks near the desired received/output peak. To avoid selecting a
+    non-peak sample, the clicked time is snapped to the nearest detected positive
+    local maximum. If no local maxima are detected, the nearest sample is used.
+    """
+    clicked_time_s = clicked_time_ms * 1e-3
+    output_signal = np.asarray(output_signal, dtype=float)
+
+    if tx_peak_time_s is None:
+        start_time_s = clicked_time_s
+    else:
+        start_time_s = tx_peak_time_s + search_delay_s
+
+    if search_end_s is None:
+        mask = time_s >= start_time_s
+    else:
+        mask = (time_s >= start_time_s) & (time_s <= search_end_s)
+
+    t_out = time_s[mask]
+    s_out = output_signal[mask]
+
+    if len(t_out) == 0:
+        idx = int(np.argmin(np.abs(time_s - clicked_time_s)))
+        return float(time_s[idx]), float(output_signal[idx]), "nearest available sample"
+
+    positive_peak = float(np.nanmax(s_out))
+    if np.isfinite(positive_peak) and positive_peak > 0:
+        peak_idx, _ = find_peaks(s_out, prominence=prominence_ratio * positive_peak)
+        peak_idx = [idx for idx in peak_idx if s_out[idx] > 0]
+    else:
+        peak_idx = []
+
+    if peak_idx:
+        nearest_local = int(min(peak_idx, key=lambda idx: abs(t_out[idx] - clicked_time_s)))
+        return float(t_out[nearest_local]), float(s_out[nearest_local]), "nearest detected positive output peak"
+
+    nearest_local = int(np.argmin(np.abs(t_out - clicked_time_s)))
+    return float(t_out[nearest_local]), float(s_out[nearest_local]), "nearest available output sample"
+
+
+def make_interactive_peak_selection_plot(
+    time_s: np.ndarray,
+    input_signal: np.ndarray,
+    output_signal: np.ndarray,
+    input_details: PeakToPeakDetails,
+    candidates_df: pd.DataFrame,
+    selected_peak_time_s: Optional[float] = None,
+    selected_peak_value: Optional[float] = None,
+    zoom_end_ms: float = 3.0,
+):
+    """Create an interactive Plotly plot for mouse-based output peak selection."""
+    if go is None:
+        return None
+
+    time_ms = time_s * 1e3
+    start_ms = 0.0
+    if input_details.input_peak_time_s is not None:
+        start_ms = max(0.0, input_details.input_peak_time_s * 1e3 - 0.2)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=time_ms,
+            y=input_signal,
+            mode="lines",
+            name="Input signal (V)",
+            line=dict(color="blue", width=1.5),
+            yaxis="y1",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=time_ms,
+            y=output_signal,
+            mode="lines",
+            name="Output signal (mV)",
+            line=dict(color="red", width=1.5, dash="dash"),
+            yaxis="y2",
+        )
+    )
+
+    if input_details.input_peak_time_s is not None and input_details.input_peak_value is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=[input_details.input_peak_time_s * 1e3],
+                y=[input_details.input_peak_value],
+                mode="markers",
+                name="Input peak",
+                marker=dict(color="blue", size=10, line=dict(color="black", width=1)),
+                yaxis="y1",
+            )
+        )
+
+    if candidates_df is not None and not candidates_df.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=candidates_df["Time (ms)"],
+                y=candidates_df["Amplitude"],
+                mode="markers+text",
+                text=[str(int(v)) for v in candidates_df["Peak number"]],
+                textposition="top center",
+                name="Detected output peak candidates",
+                marker=dict(color="black", size=8, symbol="square"),
+                yaxis="y2",
+                customdata=candidates_df[["Peak number", "Candidate label"]].values,
+                hovertemplate="Peak %{customdata[0]}<br>Time=%{x:.6f} ms<br>Amplitude=%{y:.6g}<br>%{customdata[1]}<extra></extra>",
+            )
+        )
+
+    if selected_peak_time_s is not None and selected_peak_value is not None:
+        fig.add_trace(
+            go.Scatter(
+                x=[selected_peak_time_s * 1e3],
+                y=[selected_peak_value],
+                mode="markers",
+                name="Selected output peak",
+                marker=dict(color="green", size=14, symbol="star", line=dict(color="black", width=1)),
+                yaxis="y2",
+            )
+        )
+
+    fig.update_layout(
+        title="Click on the received/output peak to use for peak-to-peak interpretation",
+        xaxis=dict(title="Time (ms)", range=[start_ms, zoom_end_ms]),
+        yaxis=dict(title="Input signal (V)", titlefont=dict(color="blue"), tickfont=dict(color="blue")),
+        yaxis2=dict(title="Output signal (mV)", titlefont=dict(color="red"), tickfont=dict(color="red"), overlaying="y", side="right"),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        height=520,
+        margin=dict(l=40, r=40, t=90, b=50),
+        hovermode="closest",
+    )
     return fig
 
 
@@ -881,9 +1035,13 @@ if analysis_mode == "Single file":
     st.subheader("Peak-to-peak output peak selection")
     p2p_selection_mode = st.radio(
         "Received/output peak used for the peak-to-peak method",
-        options=["Automatic: highest positive output peak", "Manual: select the output peak from candidates"],
+        options=["Automatic: highest positive output peak", "Manual: click the output peak on the plot"],
         horizontal=False,
     )
+
+    if p2p_selection_mode.startswith("Automatic"):
+        st.session_state.pop("clicked_output_peak_time_s", None)
+        st.session_state.pop("clicked_output_peak_value", None)
 
     if p2p_selection_mode.startswith("Manual"):
         try:
@@ -901,20 +1059,58 @@ if analysis_mode == "Single file":
                 time_unit,
             )
 
-            if manual_peak_candidates_df.empty:
-                st.warning("No candidate positive output peaks were detected in the current search window. The app will use the automatic interpretation.")
+            st.write("Click directly on the received/output peak that represents the first reliable arrival. The app will snap the click to the nearest positive output peak and use it for Vs and Gmax.")
+
+            selected_time_from_state = st.session_state.get("clicked_output_peak_time_s")
+            selected_value_from_state = st.session_state.get("clicked_output_peak_value")
+
+            if go is not None and plotly_events is not None:
+                fig_interactive = make_interactive_peak_selection_plot(
+                    candidate_time_s,
+                    candidate_input_signal,
+                    candidate_output_signal,
+                    candidate_input_details,
+                    manual_peak_candidates_df,
+                    selected_peak_time_s=selected_time_from_state,
+                    selected_peak_value=selected_value_from_state,
+                    zoom_end_ms=3.0,
+                )
+                clicked_points = plotly_events(
+                    fig_interactive,
+                    click_event=True,
+                    hover_event=False,
+                    select_event=False,
+                    override_height=540,
+                    key="peak_click_plot",
+                )
+
+                if clicked_points:
+                    clicked_time_ms = float(clicked_points[0]["x"])
+                    snapped_time_s, snapped_value, snap_note = snap_clicked_time_to_output_peak(
+                        candidate_time_s,
+                        candidate_output_signal,
+                        clicked_time_ms,
+                        candidate_input_details.input_peak_time_s,
+                    )
+                    st.session_state["clicked_output_peak_time_s"] = snapped_time_s
+                    st.session_state["clicked_output_peak_value"] = snapped_value
+                    st.success(f"Selected output peak: {snapped_time_s * 1e3:.6f} ms, amplitude = {snapped_value:.6g} ({snap_note}).")
+                    selected_output_peak_time_s = snapped_time_s
+                elif selected_time_from_state is not None:
+                    selected_output_peak_time_s = float(selected_time_from_state)
+                    st.info(f"Current selected output peak: {selected_output_peak_time_s * 1e3:.6f} ms. Click another peak to change it.")
+                else:
+                    st.info("No manual peak has been selected yet. Click on the output peak in the interactive plot, then run the analysis.")
+
+                if not manual_peak_candidates_df.empty:
+                    with st.expander("Detected output peak candidates", expanded=False):
+                        st.dataframe(manual_peak_candidates_df, use_container_width=True)
             else:
-                st.write("Select the received/output peak that represents the first reliable arrival. This avoids using a later maximum peak when the first arrival is smaller.")
-                st.dataframe(manual_peak_candidates_df, use_container_width=True)
-
-                candidate_options = [
-                    f"Peak {int(row['Peak number'])}: {row['Time (ms)']:.6f} ms, amplitude = {row['Amplitude']:.6g} ({row['Candidate label']})"
-                    for _, row in manual_peak_candidates_df.iterrows()
-                ]
-                selected_candidate_label = st.selectbox("Select output peak for peak-to-peak calculation", options=candidate_options)
-                selected_candidate_index = candidate_options.index(selected_candidate_label)
-                selected_output_peak_time_s = float(manual_peak_candidates_df.iloc[selected_candidate_index]["Time (ms)"]) * 1e-3
-
+                st.warning(
+                    "Mouse-click peak selection requires the optional package `streamlit-plotly-events`. "
+                    "Install it with: `pip install streamlit-plotly-events`. "
+                    "Until then, use the fallback manual time input below."
+                )
                 fig_candidates = make_peak_candidate_plot(
                     candidate_time_s,
                     candidate_input_signal,
@@ -925,6 +1121,10 @@ if analysis_mode == "Single file":
                 )
                 st.pyplot(fig_candidates)
                 plt.close(fig_candidates)
+                manual_time_ms = st.number_input("Enter selected output peak time manually (ms)", min_value=0.0, value=0.0, step=0.001, format="%.6f")
+                if manual_time_ms > 0:
+                    selected_output_peak_time_s = manual_time_ms * 1e-3
+
         except Exception as exc:
             st.warning(f"Manual peak selection could not be prepared: {exc}")
 
@@ -1098,3 +1298,5 @@ else:
             file_name="bender_element_batch_plots.zip",
             mime="application/zip",
         )
+
+
