@@ -263,6 +263,7 @@ def crop_window(time_s: np.ndarray, signal: np.ndarray, start_time_s: float, end
     return time_s[mask], signal[mask]
 
 
+
 def select_output_peak_in_time_window(
     time_s: np.ndarray,
     output_signal: np.ndarray,
@@ -271,7 +272,8 @@ def select_output_peak_in_time_window(
     prominence_ratio: float = 0.05,
 ) -> Tuple[Optional[float], Optional[float], str]:
     """
-    Select the strongest positive local received/output peak in the user-defined arrival window.
+    Select the strongest positive local peak of the received/output signal
+    within the manually selected arrival-time window.
     """
     if window_end_s <= window_start_s:
         return None, None, "The selected arrival-peak window is invalid."
@@ -298,62 +300,112 @@ def select_output_peak_in_time_window(
 
     if len(peak_indices) == 0:
         if np.nanmax(s_win) <= 0:
-            return None, None, "No positive output peak was found in the selected window."
-        idx = int(np.nanargmax(s_win))
+            return None, None, "No positive output peak was found inside the selected arrival window."
+        selected_idx = int(np.nanargmax(s_win))
     else:
-        idx = int(peak_indices[np.nanargmax(s_win[peak_indices])])
+        selected_idx = int(peak_indices[np.nanargmax(s_win[peak_indices])])
 
-    return float(t_win[idx]), float(s_win[idx]), "Manual sliding-window arrival peak selected successfully."
-
-
-def select_arrival_peak_with_sliding_window(
-    time_s: np.ndarray,
-    output_signal: np.ndarray,
-    window_start_s: float,
-    window_end_s: float,
-    prominence_ratio: float = 0.05,
-) -> Tuple[Optional[float], Optional[float], str]:
-    """
-    Select the potential arrival peak from the received/output signal using a user-defined time window.
-
-    The user moves a sliding time window over the arrival signal. Inside this window,
-    the function first searches for positive local peaks. If local peaks are found,
-    the strongest positive local peak is selected. If no local peak is found, the
-    maximum positive point in the selected window is used as a fallback.
-    """
-    if window_end_s <= window_start_s:
-        return None, None, "The selected arrival-peak window is invalid."
-
-    mask = (time_s >= window_start_s) & (time_s <= window_end_s)
-    if not np.any(mask):
-        return None, None, "No data were found inside the selected arrival-peak window."
-
-    t_win = time_s[mask]
-    s_win = output_signal[mask]
-
-    if len(t_win) < 3:
-        return None, None, "The selected arrival-peak window is too narrow."
-
-    max_abs = float(np.nanmax(np.abs(s_win)))
-    if not np.isfinite(max_abs) or max_abs == 0:
-        return None, None, "The selected arrival-peak window has no usable output signal."
-
-    candidate_peaks, _ = find_peaks(s_win, prominence=prominence_ratio * max_abs)
-    candidate_peaks = np.array(
-        [idx for idx in candidate_peaks if np.isfinite(s_win[idx]) and s_win[idx] > 0],
-        dtype=int,
+    return (
+        float(t_win[selected_idx]),
+        float(s_win[selected_idx]),
+        "Manual sliding-window arrival peak selected successfully.",
     )
 
-    if len(candidate_peaks) > 0:
-        selected_idx = int(candidate_peaks[np.nanargmax(s_win[candidate_peaks])])
-        note = "Manual sliding-window selection: strongest positive local peak inside the selected arrival window was used."
-    else:
-        if float(np.nanmax(s_win)) <= 0:
-            return None, None, "No positive output peak was found inside the selected arrival-peak window."
-        selected_idx = int(np.nanargmax(s_win))
-        note = "Manual sliding-window selection: no local peak was detected, so the maximum positive point inside the selected arrival window was used."
 
-    return float(t_win[selected_idx]), float(s_win[selected_idx]), note
+def prepare_preview_signals(
+    file_obj,
+    time_col: str,
+    input_col: str,
+    output_col: str,
+    time_unit: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load and preprocess the selected file for displaying the signal preview
+    before running the final analysis.
+    """
+    df, _ = load_be_file(file_obj)
+    try:
+        file_obj.seek(0)
+    except Exception:
+        pass
+
+    time_raw = df[time_col].to_numpy(dtype=float)
+    input_raw = df[input_col].to_numpy(dtype=float)
+    output_raw = df[output_col].to_numpy(dtype=float)
+
+    valid_mask = np.isfinite(time_raw) & np.isfinite(input_raw) & np.isfinite(output_raw)
+    time_raw = time_raw[valid_mask]
+    input_raw = input_raw[valid_mask]
+    output_raw = output_raw[valid_mask]
+
+    if len(time_raw) < 10:
+        raise ValueError("The cleaned data contain too few valid rows for preview.")
+
+    time_s, _ = get_sampling_info(time_raw, time_unit)
+    input_processed = input_raw - np.nanmean(input_raw)
+    output_processed = output_raw - np.nanmean(output_raw)
+
+    return time_s, input_processed, output_processed
+
+
+def make_signal_preview_plot(
+    time_s: np.ndarray,
+    input_signal: np.ndarray,
+    output_signal: np.ndarray,
+    arrival_window_ms: Optional[Tuple[float, float]] = None,
+    zoom_end_ms: float = 3.0,
+):
+    """
+    Plot input and output signals before final analysis.
+    The selected manual arrival window is shown as a shaded band.
+    """
+    fig, ax1 = plt.subplots(figsize=(11, 4.8))
+    time_ms = time_s * 1e3
+
+    line_in, = ax1.plot(
+        time_ms,
+        input_signal,
+        linewidth=1.2,
+        color="blue",
+        label="Input signal (V)",
+    )
+    ax1.set_xlabel("Time (ms)")
+    ax1.set_ylabel("Input signal (V)", color="blue")
+    ax1.tick_params(axis="y", labelcolor="blue")
+    ax1.grid(alpha=0.3)
+
+    ax2 = ax1.twinx()
+    line_out, = ax2.plot(
+        time_ms,
+        output_signal,
+        linewidth=1.2,
+        linestyle="--",
+        color="red",
+        label="Output signal (mV)",
+    )
+    ax2.set_ylabel("Output signal (mV)", color="red")
+    ax2.tick_params(axis="y", labelcolor="red")
+
+    handles = [line_in, line_out]
+    labels = ["Input signal (V)", "Output signal (mV)"]
+
+    if arrival_window_ms is not None:
+        ax1.axvspan(
+            arrival_window_ms[0],
+            arrival_window_ms[1],
+            alpha=0.18,
+            color="gray",
+            label="Selected arrival-peak window",
+        )
+        handles.append(plt.Line2D([0], [0], color="gray", linewidth=6, alpha=0.30))
+        labels.append("Selected arrival-peak window")
+
+    ax1.set_xlim(0.0, zoom_end_ms)
+    ax1.set_title("Signal preview for manual arrival-peak window selection")
+    ax1.legend(handles, labels)
+    fig.tight_layout()
+    return fig
+
 
 
 
@@ -365,7 +417,6 @@ def peak_to_peak_method(
     search_delay_s: float,
     search_end_s: Optional[float],
     prominence_ratio: float,
-    manual_arrival_window_s: Optional[Tuple[float, float]] = None,
 ) -> Tuple[Optional[float], Optional[float], str, PeakToPeakDetails]:
     input_signal = np.asarray(input_signal, dtype=float)
     output_signal = np.asarray(output_signal, dtype=float)
@@ -388,33 +439,6 @@ def peak_to_peak_method(
     tx_peak_value = float(input_signal[tx_idx])
 
     start_time_s = tx_peak_time_s + search_delay_s
-
-    if manual_arrival_window_s is not None:
-        window_start_s, window_end_s = manual_arrival_window_s
-
-        if window_start_s < start_time_s:
-            window_start_s = start_time_s
-
-        selected_time_s, selected_value, manual_note = select_arrival_peak_with_sliding_window(
-            time_s,
-            output_signal,
-            window_start_s,
-            window_end_s,
-            prominence_ratio=0.05,
-        )
-
-        if selected_time_s is None:
-            return tx_peak_time_s, None, manual_note, PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
-
-        rx_peak_time_s = selected_time_s
-        rx_peak_value = selected_value
-
-        if rx_peak_time_s <= tx_peak_time_s:
-            return tx_peak_time_s, None, "The manually selected arrival peak gives a non-positive travel time. Move the sliding window after the input peak.", PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, rx_peak_value)
-
-        details = PeakToPeakDetails(tx_peak_time_s, rx_peak_time_s, tx_peak_value, rx_peak_value)
-        return tx_peak_time_s, rx_peak_time_s, manual_note, details
-
     t_out, s_out = crop_window(time_s, output_signal, start_time_s, search_end_s)
     if len(t_out) < 5:
         return tx_peak_time_s, None, "Insufficient data in the peak-to-peak search window.", PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
@@ -431,7 +455,7 @@ def peak_to_peak_method(
         return tx_peak_time_s, None, "Peak-to-peak travel time is not positive.", PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
 
     details = PeakToPeakDetails(tx_peak_time_s, rx_peak_time_s, tx_peak_value, rx_peak_value)
-    return tx_peak_time_s, rx_peak_time_s, "Automatic peak-to-peak interpretation: travel time is measured from the transmitted positive peak time to the highest positive point of the received signal within the default search window.", details
+    return tx_peak_time_s, rx_peak_time_s, "Travel time is measured from the transmitted positive peak time to the highest positive point of the received signal within the search window.", details
 
 
 
@@ -559,110 +583,6 @@ def add_average_gmax_row(results_df: pd.DataFrame) -> pd.DataFrame:
 
 
 
-
-def make_signal_preview_plot(
-    time_s: np.ndarray,
-    input_signal: np.ndarray,
-    output_signal: np.ndarray,
-    window_ms: Optional[Tuple[float, float]] = None,
-    zoom_end_ms: float = 3.0,
-):
-    """
-    Preview the transmitted and received signals before final analysis.
-
-    This plot is shown while the user adjusts the sliding window so that the
-    appropriate arrival peak can be visually bracketed before running the
-    final peak-to-peak calculation.
-    """
-    fig, ax1 = plt.subplots(figsize=(11, 4.8))
-    time_ms = time_s * 1e3
-
-    line_in, = ax1.plot(
-        time_ms,
-        input_signal,
-        linewidth=1.2,
-        color="blue",
-        label="Input signal (V)",
-    )
-    ax1.set_xlabel("Time (ms)")
-    ax1.set_ylabel("Input signal (V)", color="blue")
-    ax1.tick_params(axis="y", labelcolor="blue")
-    ax1.grid(alpha=0.3)
-
-    ax2 = ax1.twinx()
-    line_out, = ax2.plot(
-        time_ms,
-        output_signal,
-        linewidth=1.2,
-        linestyle="--",
-        color="red",
-        label="Output signal (mV)",
-    )
-    ax2.set_ylabel("Output signal (mV)", color="red")
-    ax2.tick_params(axis="y", labelcolor="red")
-
-    if window_ms is not None:
-        ax1.axvspan(
-            window_ms[0],
-            window_ms[1],
-            alpha=0.18,
-            color="gray",
-            label="Selected arrival-peak window",
-        )
-
-    ax1.set_xlim(0.0, zoom_end_ms)
-    ax1.set_title("Signal preview for manual arrival-peak window selection")
-
-    handles = [line_in, line_out]
-    labels = ["Input signal (V)", "Output signal (mV)"]
-    if window_ms is not None:
-        handles.append(plt.Line2D([0], [0], color="gray", linewidth=6, alpha=0.3))
-        labels.append("Selected arrival-peak window")
-    ax1.legend(handles, labels)
-
-    fig.tight_layout()
-    return fig
-
-
-def prepare_preview_signals(
-    file_obj,
-    time_col: str,
-    input_col: str,
-    output_col: str,
-    time_unit: str,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Load and preprocess the selected file only for preview plotting.
-    """
-    current_pos = None
-    try:
-        current_pos = file_obj.tell()
-    except Exception:
-        current_pos = None
-
-    df, _ = load_be_file(file_obj)
-
-    try:
-        file_obj.seek(0)
-    except Exception:
-        pass
-
-    time_raw = df[time_col].to_numpy(dtype=float)
-    input_raw = df[input_col].to_numpy(dtype=float)
-    output_raw = df[output_col].to_numpy(dtype=float)
-
-    valid_mask = np.isfinite(time_raw) & np.isfinite(input_raw) & np.isfinite(output_raw)
-    time_raw = time_raw[valid_mask]
-    input_raw = input_raw[valid_mask]
-    output_raw = output_raw[valid_mask]
-
-    time_s, _ = get_sampling_info(time_raw, time_unit)
-    input_processed = input_raw - np.nanmean(input_raw)
-    output_processed = output_raw - np.nanmean(output_raw)
-
-    return time_s, input_processed, output_processed
-
-
 def make_peak_to_peak_plot(
     time_s: np.ndarray,
     input_signal: np.ndarray,
@@ -746,15 +666,13 @@ def make_peak_to_peak_plot(
     if details.input_peak_time_s is not None:
         start_ms = max(0.0, details.input_peak_time_s * 1e3 - 0.2)
 
-    window_handle = None
     if manual_arrival_window_ms is not None:
-        window_handle = ax1.axvspan(
+        ax1.axvspan(
             manual_arrival_window_ms[0],
             manual_arrival_window_ms[1],
-            alpha=0.18,
+            alpha=0.15,
             color="gray",
-            label="Selected arrival window",
-            zorder=0,
+            label="Selected arrival-peak window",
         )
 
     ax1.set_xlim(start_ms, zoom_end_ms)
@@ -762,9 +680,6 @@ def make_peak_to_peak_plot(
 
     handles = [line_in, line_out] + peak_handles
     labels = ["Input signal (V)", "Output signal (mV)"] + peak_labels
-    if window_handle is not None:
-        handles.append(window_handle)
-        labels.append("Selected arrival window")
     ax1.legend(handles, labels)
 
     fig.tight_layout()
@@ -869,10 +784,6 @@ def analyze_file(
 
     results: Dict[str, AnalysisResult] = {}
 
-    manual_arrival_window_s = None
-    if manual_arrival_window_ms is not None:
-        manual_arrival_window_s = (manual_arrival_window_ms[0] * 1e-3, manual_arrival_window_ms[1] * 1e-3)
-
     tx_peak_time_s, rx_peak_time_s, note_p2p, peak_details = peak_to_peak_method(
         time_s,
         input_processed,
@@ -881,8 +792,35 @@ def analyze_file(
         search_delay_s,
         search_end_s,
         peak_prominence_ratio,
-        manual_arrival_window_s=manual_arrival_window_s,
     )
+
+    if manual_arrival_window_ms is not None:
+        window_start_s = manual_arrival_window_ms[0] * 1e-3
+        window_end_s = manual_arrival_window_ms[1] * 1e-3
+
+        selected_rx_time_s, selected_rx_value, manual_note = select_output_peak_in_time_window(
+            time_s,
+            output_processed,
+            window_start_s,
+            window_end_s,
+            prominence_ratio=0.05,
+        )
+
+        if selected_rx_time_s is not None and tx_peak_time_s is not None and selected_rx_time_s > tx_peak_time_s:
+            rx_peak_time_s = selected_rx_time_s
+            note_p2p = (
+                "Manual sliding-window interpretation: travel time is measured from the transmitted "
+                "input peak to the strongest positive received/output peak inside the selected arrival window."
+            )
+            peak_details = PeakToPeakDetails(
+                tx_peak_time_s,
+                rx_peak_time_s,
+                peak_details.input_peak_value,
+                selected_rx_value,
+            )
+        else:
+            note_p2p = f"Manual sliding-window selection failed or was not physically valid. {manual_note}"
+
     results["Peak-to-peak"] = calculate_vs_and_gmax(
         rx_peak_time_s,
         reference_time_s,
@@ -995,40 +933,27 @@ with meta1:
 with meta2:
     density_kg_m3 = st.number_input("Bulk density ρ (kg/m³)", min_value=0.001, value=2000.0, step=10.0, format="%.3f")
 
-
-manual_peak_window_ms = None
-preview_zoom_end_ms = 3.0
-
-manual_peak_window_ms = None
-preview_zoom_end_ms = 3.0
+manual_arrival_window_ms = None
+plot_time_end_ms = 3.0
 
 st.subheader("Peak-to-peak interpretation settings")
-peak_mode = st.radio(
-    "Output peak selection mode",
-    options=["Automatic highest positive peak", "Manual sliding-window selection"],
+peak_selection_mode = st.radio(
+    "Arrival peak selection mode",
+    options=["Automatic peak-to-peak", "Manual sliding-window"],
     horizontal=True,
 )
 
-if peak_mode == "Manual sliding-window selection":
+if peak_selection_mode == "Manual sliding-window":
     st.info(
-        "First inspect the signal preview below, then adjust the window to cover the potential first-arrival peak "
-        "of the received/output signal. The selected window is shown as the gray shaded region."
+        "Adjust the sliding window to cover the potential arrival peak in the received/output signal. "
+        "The plot updates immediately and shows the selected window as a gray shaded band."
     )
 
-    preview_zoom_end_ms = st.slider(
-        "Preview plot time range (ms)",
-        min_value=0.5,
-        max_value=10.0,
-        value=3.0,
-        step=0.1,
-        help="Increase this value if the received arrival appears after 3 ms.",
-    )
-
-    manual_peak_window_ms = st.slider(
+    manual_arrival_window_ms = st.slider(
         "Select arrival-peak window on the received/output signal (ms)",
         min_value=0.0,
-        max_value=float(preview_zoom_end_ms),
-        value=(0.20, min(1.50, float(preview_zoom_end_ms))),
+        max_value=3.0,
+        value=(0.20, 1.50),
         step=0.01,
         help="The peak-to-peak method will use the strongest positive received/output peak inside this selected window.",
     )
@@ -1041,17 +966,17 @@ if peak_mode == "Manual sliding-window selection":
             output_col,
             time_unit,
         )
-        fig_manual_preview = make_signal_preview_plot(
+        fig_preview = make_signal_preview_plot(
             preview_time_s,
             preview_input_processed,
             preview_output_processed,
-            window_ms=manual_peak_window_ms,
-            zoom_end_ms=float(preview_zoom_end_ms),
+            arrival_window_ms=manual_arrival_window_ms,
+            zoom_end_ms=plot_time_end_ms,
         )
-        st.pyplot(fig_manual_preview)
-        plt.close(fig_manual_preview)
+        st.pyplot(fig_preview)
+        plt.close(fig_preview)
     except Exception as exc:
-        st.warning(f"Could not generate the manual-selection preview plot: {exc}")
+        st.warning(f"Could not generate the manual-selection signal preview: {exc}")
 
 run_analysis = st.button("Run analysis", type="primary")
 if not run_analysis:
@@ -1092,7 +1017,7 @@ for file_obj in file_list:
             analysis_output.input_processed,
             analysis_output.output_processed,
             analysis_output.peak_details,
-            preview_zoom_end_ms,
+            plot_time_end_ms,
             manual_arrival_window_ms=manual_arrival_window_ms,
         )
         plot_files[f"{safe_stem}_peak_to_peak.png"] = fig_to_png_bytes(fig_peak)
@@ -1111,8 +1036,6 @@ if errors:
 
 if not all_results_tables:
     st.stop()
-
-preview_zoom_end_ms = float(preview_zoom_end_ms) if "preview_zoom_end_ms" in locals() else 3.0
 
 results_table_all = pd.concat(all_results_tables, ignore_index=True)
 
@@ -1142,7 +1065,7 @@ if analysis_mode == "Single file":
             single_output.input_processed,
             single_output.output_processed,
             single_output.peak_details,
-            preview_zoom_end_ms,
+            plot_time_end_ms,
             manual_arrival_window_ms=manual_arrival_window_ms,
         )
         st.pyplot(fig_peak_display)
@@ -1169,7 +1092,7 @@ else:
                     analysis_output.input_processed,
                     analysis_output.output_processed,
                     analysis_output.peak_details,
-                    preview_zoom_end_ms,
+                    plot_time_end_ms,
                     manual_arrival_window_ms=manual_arrival_window_ms,
                 )
                 st.pyplot(fig_peak_display)
