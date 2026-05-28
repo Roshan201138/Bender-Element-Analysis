@@ -952,6 +952,10 @@ with meta1:
 with meta2:
     density_kg_m3 = st.number_input("Bulk density ρ (kg/m³)", min_value=0.001, value=2000.0, step=10.0, format="%.3f")
 
+
+manual_peak_window_ms = None
+preview_zoom_end_ms = 3.0
+
 st.subheader("Peak-to-peak interpretation settings")
 peak_selection_mode = st.radio(
     "Arrival peak selection for the peak-to-peak method",
@@ -974,6 +978,12 @@ if peak_selection_mode == "Manual sliding window":
         "Use this option when the first arrival peak is not the maximum peak of the received signal. "
         "After running the analysis, the selected window is shaded in the peak-to-peak plot."
     )
+
+
+if 'manual_peak_window_ms' not in locals():
+    manual_peak_window_ms = None
+if 'preview_zoom_end_ms' not in locals():
+    preview_zoom_end_ms = 3.0
 
 run_analysis = st.button("Run analysis", type="primary")
 if not run_analysis:
@@ -1014,7 +1024,7 @@ for file_obj in file_list:
             analysis_output.input_processed,
             analysis_output.output_processed,
             analysis_output.peak_details,
-            float(preview_zoom_end_ms),
+            plot_zoom_end_ms,
             manual_arrival_window_ms=manual_arrival_window_ms,
         )
         plot_files[f"{safe_stem}_peak_to_peak.png"] = fig_to_png_bytes(fig_peak)
@@ -1033,6 +1043,8 @@ if errors:
 
 if not all_results_tables:
     st.stop()
+
+plot_zoom_end_ms = float(preview_zoom_end_ms) if "preview_zoom_end_ms" in locals() else 3.0
 
 results_table_all = pd.concat(all_results_tables, ignore_index=True)
 
@@ -1062,7 +1074,7 @@ if analysis_mode == "Single file":
             single_output.input_processed,
             single_output.output_processed,
             single_output.peak_details,
-            float(preview_zoom_end_ms),
+            plot_zoom_end_ms,
             manual_arrival_window_ms=manual_arrival_window_ms,
         )
         st.pyplot(fig_peak_display)
@@ -1089,7 +1101,7 @@ else:
                     analysis_output.input_processed,
                     analysis_output.output_processed,
                     analysis_output.peak_details,
-                    float(preview_zoom_end_ms),
+                    plot_zoom_end_ms,
                     manual_arrival_window_ms=manual_arrival_window_ms,
                 )
                 st.pyplot(fig_peak_display)
