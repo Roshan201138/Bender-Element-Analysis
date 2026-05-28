@@ -38,16 +38,6 @@ import pandas as pd
 import streamlit as st
 from scipy.signal import correlate, find_peaks
 
-try:
-    import plotly.graph_objects as go
-except Exception:
-    go = None
-
-try:
-    from streamlit_plotly_events import plotly_events
-except Exception:
-    plotly_events = None
-
 
 st.set_page_config(page_title="Bender Element Signal Interpretation App", layout="wide")
 
@@ -273,7 +263,7 @@ def crop_window(time_s: np.ndarray, signal: np.ndarray, start_time_s: float, end
     return time_s[mask], signal[mask]
 
 
-def select_output_peak_in_time_window(
+def select_arrival_peak_with_sliding_window(
     time_s: np.ndarray,
     output_signal: np.ndarray,
     window_start_s: float,
@@ -281,39 +271,46 @@ def select_output_peak_in_time_window(
     prominence_ratio: float = 0.05,
 ) -> Tuple[Optional[float], Optional[float], str]:
     """
-    Select the strongest positive received/output peak within a user-defined time window.
+    Select the potential arrival peak from the received/output signal using a user-defined time window.
+
+    The user moves a sliding time window over the arrival signal. Inside this window,
+    the function first searches for positive local peaks. If local peaks are found,
+    the strongest positive local peak is selected. If no local peak is found, the
+    maximum positive point in the selected window is used as a fallback.
     """
     if window_end_s <= window_start_s:
-        return None, None, "The selected output-peak window is invalid."
+        return None, None, "The selected arrival-peak window is invalid."
 
     mask = (time_s >= window_start_s) & (time_s <= window_end_s)
     if not np.any(mask):
-        return None, None, "No data exist inside the selected output-peak window."
+        return None, None, "No data were found inside the selected arrival-peak window."
 
     t_win = time_s[mask]
     s_win = output_signal[mask]
 
     if len(t_win) < 3:
-        return None, None, "The selected output-peak window is too narrow."
+        return None, None, "The selected arrival-peak window is too narrow."
 
-    max_abs = np.nanmax(np.abs(s_win))
+    max_abs = float(np.nanmax(np.abs(s_win)))
     if not np.isfinite(max_abs) or max_abs == 0:
-        return None, None, "The selected window has no usable output signal."
+        return None, None, "The selected arrival-peak window has no usable output signal."
 
-    peak_indices, _ = find_peaks(s_win, prominence=prominence_ratio * max_abs)
-    peak_indices = np.array(
-        [idx for idx in peak_indices if np.isfinite(s_win[idx]) and s_win[idx] > 0],
+    candidate_peaks, _ = find_peaks(s_win, prominence=prominence_ratio * max_abs)
+    candidate_peaks = np.array(
+        [idx for idx in candidate_peaks if np.isfinite(s_win[idx]) and s_win[idx] > 0],
         dtype=int,
     )
 
-    if len(peak_indices) == 0:
-        if np.nanmax(s_win) <= 0:
-            return None, None, "No positive output peak was found in the selected window."
-        idx = int(np.nanargmax(s_win))
+    if len(candidate_peaks) > 0:
+        selected_idx = int(candidate_peaks[np.nanargmax(s_win[candidate_peaks])])
+        note = "Manual sliding-window selection: strongest positive local peak inside the selected arrival window was used."
     else:
-        idx = int(peak_indices[np.nanargmax(s_win[peak_indices])])
+        if float(np.nanmax(s_win)) <= 0:
+            return None, None, "No positive output peak was found inside the selected arrival-peak window."
+        selected_idx = int(np.nanargmax(s_win))
+        note = "Manual sliding-window selection: no local peak was detected, so the maximum positive point inside the selected arrival window was used."
 
-    return float(t_win[idx]), float(s_win[idx]), "Manual sliding-window peak selected successfully."
+    return float(t_win[selected_idx]), float(s_win[selected_idx]), note
 
 
 
@@ -325,7 +322,7 @@ def peak_to_peak_method(
     search_delay_s: float,
     search_end_s: Optional[float],
     prominence_ratio: float,
-    selected_output_peak_time_s: Optional[float] = None,
+    manual_arrival_window_s: Optional[Tuple[float, float]] = None,
 ) -> Tuple[Optional[float], Optional[float], str, PeakToPeakDetails]:
     input_signal = np.asarray(input_signal, dtype=float)
     output_signal = np.asarray(output_signal, dtype=float)
@@ -348,6 +345,33 @@ def peak_to_peak_method(
     tx_peak_value = float(input_signal[tx_idx])
 
     start_time_s = tx_peak_time_s + search_delay_s
+
+    if manual_arrival_window_s is not None:
+        window_start_s, window_end_s = manual_arrival_window_s
+
+        if window_start_s < start_time_s:
+            window_start_s = start_time_s
+
+        selected_time_s, selected_value, manual_note = select_arrival_peak_with_sliding_window(
+            time_s,
+            output_signal,
+            window_start_s,
+            window_end_s,
+            prominence_ratio=0.05,
+        )
+
+        if selected_time_s is None:
+            return tx_peak_time_s, None, manual_note, PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
+
+        rx_peak_time_s = selected_time_s
+        rx_peak_value = selected_value
+
+        if rx_peak_time_s <= tx_peak_time_s:
+            return tx_peak_time_s, None, "The manually selected arrival peak gives a non-positive travel time. Move the sliding window after the input peak.", PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, rx_peak_value)
+
+        details = PeakToPeakDetails(tx_peak_time_s, rx_peak_time_s, tx_peak_value, rx_peak_value)
+        return tx_peak_time_s, rx_peak_time_s, manual_note, details
+
     t_out, s_out = crop_window(time_s, output_signal, start_time_s, search_end_s)
     if len(t_out) < 5:
         return tx_peak_time_s, None, "Insufficient data in the peak-to-peak search window.", PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
@@ -356,18 +380,7 @@ def peak_to_peak_method(
     if not np.isfinite(output_peak) or output_peak <= 0:
         return tx_peak_time_s, None, "A positive output peak could not be identified.", PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
 
-    if selected_output_peak_time_s is not None:
-        # Use the user-selected received/output peak. The nearest available sample
-        # is used so the selected value remains valid even if the sampling interval
-        # prevents an exact time match.
-        if selected_output_peak_time_s < t_out[0] or selected_output_peak_time_s > t_out[-1]:
-            return tx_peak_time_s, None, "The selected output peak is outside the peak-to-peak search window.", PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
-        rx_local_idx = int(np.argmin(np.abs(t_out - selected_output_peak_time_s)))
-        note = "Travel time is measured from the transmitted positive peak time to the user-selected received/output peak."
-    else:
-        rx_local_idx = int(np.argmax(s_out))
-        note = "Travel time is measured from the transmitted positive peak time to the highest positive point of the received signal within the search window."
-
+    rx_local_idx = int(np.argmax(s_out))
     rx_peak_time_s = float(t_out[rx_local_idx])
     rx_peak_value = float(s_out[rx_local_idx])
 
@@ -375,262 +388,7 @@ def peak_to_peak_method(
         return tx_peak_time_s, None, "Peak-to-peak travel time is not positive.", PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
 
     details = PeakToPeakDetails(tx_peak_time_s, rx_peak_time_s, tx_peak_value, rx_peak_value)
-    return tx_peak_time_s, rx_peak_time_s, note, details
-
-
-def get_peak_to_peak_candidates(
-    file_obj,
-    time_col: str,
-    input_col: str,
-    output_col: str,
-    time_unit: str,
-    prominence_ratio: float = 0.15,
-    search_delay_s: float = 0.05e-3,
-    search_end_s: Optional[float] = 3.0e-3,
-) -> Tuple[pd.DataFrame, np.ndarray, np.ndarray, np.ndarray, PeakToPeakDetails]:
-    """Return candidate received/output peaks for manual peak-to-peak selection.
-
-    The transmitted/input peak is detected first. Then all positive received/output
-    peaks inside the same interpretation window are listed so the user can select
-    the physically correct first arrival peak when it is not the maximum peak.
-    """
-    df, _ = load_be_file(file_obj)
-    time_raw = df[time_col].to_numpy(dtype=float)
-    input_raw = df[input_col].to_numpy(dtype=float)
-    output_raw = df[output_col].to_numpy(dtype=float)
-
-    valid_mask = np.isfinite(time_raw) & np.isfinite(input_raw) & np.isfinite(output_raw)
-    time_raw = time_raw[valid_mask]
-    input_raw = input_raw[valid_mask]
-    output_raw = output_raw[valid_mask]
-
-    time_s, _ = get_sampling_info(time_raw, time_unit)
-    input_processed = input_raw - np.nanmean(input_raw)
-    output_processed = output_raw - np.nanmean(output_raw)
-
-    reference_time_s = estimate_reference_time(time_s, input_processed, threshold_ratio=0.10)
-
-    input_peak = float(np.nanmax(input_processed))
-    input_peaks, _ = find_peaks(input_processed, prominence=prominence_ratio * input_peak)
-    if len(input_peaks) == 0:
-        tx_idx = int(np.argmax(input_processed))
-    else:
-        valid_input_peaks = input_peaks[time_s[input_peaks] >= reference_time_s]
-        tx_idx = int(valid_input_peaks[0]) if len(valid_input_peaks) > 0 else int(input_peaks[np.argmax(input_processed[input_peaks])])
-
-    tx_peak_time_s = float(time_s[tx_idx])
-    tx_peak_value = float(input_processed[tx_idx])
-
-    start_time_s = tx_peak_time_s + search_delay_s
-    mask = (time_s >= start_time_s) if search_end_s is None else ((time_s >= start_time_s) & (time_s <= search_end_s))
-    t_out = time_s[mask]
-    s_out = output_processed[mask]
-
-    if len(t_out) < 5:
-        empty = pd.DataFrame(columns=["Peak number", "Time (ms)", "Amplitude", "Candidate label"])
-        return empty, time_s, input_processed, output_processed, PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
-
-    positive_peak = float(np.nanmax(s_out))
-    if not np.isfinite(positive_peak) or positive_peak <= 0:
-        empty = pd.DataFrame(columns=["Peak number", "Time (ms)", "Amplitude", "Candidate label"])
-        return empty, time_s, input_processed, output_processed, PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
-
-    output_peaks_local, _ = find_peaks(s_out, prominence=prominence_ratio * positive_peak)
-    output_peaks_local = [idx for idx in output_peaks_local if s_out[idx] > 0]
-
-    if len(output_peaks_local) == 0:
-        output_peaks_local = [int(np.argmax(s_out))]
-
-    rows = []
-    max_local_idx = int(np.argmax(s_out))
-    first_peak_time_s = float(t_out[output_peaks_local[0]])
-    max_peak_time_s = float(t_out[max_local_idx])
-
-    for number, local_idx in enumerate(output_peaks_local, start=1):
-        peak_time_s = float(t_out[local_idx])
-        labels = []
-        if np.isclose(peak_time_s, first_peak_time_s):
-            labels.append("first detected positive peak")
-        if np.isclose(peak_time_s, max_peak_time_s):
-            labels.append("maximum positive peak")
-        rows.append({
-            "Peak number": number,
-            "Time (ms)": peak_time_s * 1e3,
-            "Amplitude": float(s_out[local_idx]),
-            "Candidate label": "; ".join(labels) if labels else "candidate positive peak",
-        })
-
-    candidates_df = pd.DataFrame(rows)
-    details = PeakToPeakDetails(tx_peak_time_s, None, tx_peak_value, None)
-    return candidates_df, time_s, input_processed, output_processed, details
-
-
-def make_peak_candidate_plot(
-    time_s: np.ndarray,
-    input_signal: np.ndarray,
-    output_signal: np.ndarray,
-    input_details: PeakToPeakDetails,
-    candidates_df: pd.DataFrame,
-    zoom_end_ms: float = 3.0,
-):
-    fig = make_peak_to_peak_plot(time_s, input_signal, output_signal, input_details, zoom_end_ms)
-    ax1 = fig.axes[0]
-    ax2 = fig.axes[1]
-
-    for _, row in candidates_df.iterrows():
-        t_ms = float(row["Time (ms)"])
-        amp = float(row["Amplitude"])
-        number = int(row["Peak number"])
-        ax2.plot(t_ms, amp, marker="s", linestyle="None", markersize=6, color="black", zorder=6)
-        ax2.annotate(str(number), xy=(t_ms, amp), xytext=(4, 4), textcoords="offset points", fontsize=9, color="black")
-
-    ax1.set_title("Candidate received/output peaks for manual peak-to-peak selection")
-    fig.tight_layout()
-    return fig
-
-
-def snap_clicked_time_to_output_peak(
-    time_s: np.ndarray,
-    output_signal: np.ndarray,
-    clicked_time_ms: float,
-    tx_peak_time_s: Optional[float],
-    search_delay_s: float = 0.05e-3,
-    search_end_s: Optional[float] = 3.0e-3,
-    prominence_ratio: float = 0.15,
-) -> Tuple[float, float, str]:
-    """Snap a mouse click to the nearest positive output peak in the valid search window.
-
-    The user clicks near the desired received/output peak. To avoid selecting a
-    non-peak sample, the clicked time is snapped to the nearest detected positive
-    local maximum. If no local maxima are detected, the nearest sample is used.
-    """
-    clicked_time_s = clicked_time_ms * 1e-3
-    output_signal = np.asarray(output_signal, dtype=float)
-
-    if tx_peak_time_s is None:
-        start_time_s = clicked_time_s
-    else:
-        start_time_s = tx_peak_time_s + search_delay_s
-
-    if search_end_s is None:
-        mask = time_s >= start_time_s
-    else:
-        mask = (time_s >= start_time_s) & (time_s <= search_end_s)
-
-    t_out = time_s[mask]
-    s_out = output_signal[mask]
-
-    if len(t_out) == 0:
-        idx = int(np.argmin(np.abs(time_s - clicked_time_s)))
-        return float(time_s[idx]), float(output_signal[idx]), "nearest available sample"
-
-    positive_peak = float(np.nanmax(s_out))
-    if np.isfinite(positive_peak) and positive_peak > 0:
-        peak_idx, _ = find_peaks(s_out, prominence=prominence_ratio * positive_peak)
-        peak_idx = [idx for idx in peak_idx if s_out[idx] > 0]
-    else:
-        peak_idx = []
-
-    if peak_idx:
-        nearest_local = int(min(peak_idx, key=lambda idx: abs(t_out[idx] - clicked_time_s)))
-        return float(t_out[nearest_local]), float(s_out[nearest_local]), "nearest detected positive output peak"
-
-    nearest_local = int(np.argmin(np.abs(t_out - clicked_time_s)))
-    return float(t_out[nearest_local]), float(s_out[nearest_local]), "nearest available output sample"
-
-
-def make_interactive_peak_selection_plot(
-    time_s: np.ndarray,
-    input_signal: np.ndarray,
-    output_signal: np.ndarray,
-    input_details: PeakToPeakDetails,
-    candidates_df: pd.DataFrame,
-    selected_peak_time_s: Optional[float] = None,
-    selected_peak_value: Optional[float] = None,
-    zoom_end_ms: float = 3.0,
-):
-    """Create an interactive Plotly plot for mouse-based output peak selection."""
-    if go is None:
-        return None
-
-    time_ms = time_s * 1e3
-    start_ms = 0.0
-    if input_details.input_peak_time_s is not None:
-        start_ms = max(0.0, input_details.input_peak_time_s * 1e3 - 0.2)
-
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter(
-            x=time_ms,
-            y=input_signal,
-            mode="lines",
-            name="Input signal (V)",
-            line=dict(color="blue", width=1.5),
-            yaxis="y1",
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=time_ms,
-            y=output_signal,
-            mode="lines",
-            name="Output signal (mV)",
-            line=dict(color="red", width=1.5, dash="dash"),
-            yaxis="y2",
-        )
-    )
-
-    if input_details.input_peak_time_s is not None and input_details.input_peak_value is not None:
-        fig.add_trace(
-            go.Scatter(
-                x=[input_details.input_peak_time_s * 1e3],
-                y=[input_details.input_peak_value],
-                mode="markers",
-                name="Input peak",
-                marker=dict(color="blue", size=10, line=dict(color="black", width=1)),
-                yaxis="y1",
-            )
-        )
-
-    if candidates_df is not None and not candidates_df.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=candidates_df["Time (ms)"],
-                y=candidates_df["Amplitude"],
-                mode="markers+text",
-                text=[str(int(v)) for v in candidates_df["Peak number"]],
-                textposition="top center",
-                name="Detected output peak candidates",
-                marker=dict(color="black", size=8, symbol="square"),
-                yaxis="y2",
-                customdata=candidates_df[["Peak number", "Candidate label"]].values,
-                hovertemplate="Peak %{customdata[0]}<br>Time=%{x:.6f} ms<br>Amplitude=%{y:.6g}<br>%{customdata[1]}<extra></extra>",
-            )
-        )
-
-    if selected_peak_time_s is not None and selected_peak_value is not None:
-        fig.add_trace(
-            go.Scatter(
-                x=[selected_peak_time_s * 1e3],
-                y=[selected_peak_value],
-                mode="markers",
-                name="Selected output peak",
-                marker=dict(color="green", size=14, symbol="star", line=dict(color="black", width=1)),
-                yaxis="y2",
-            )
-        )
-
-    fig.update_layout(
-        title="Click on the received/output peak to use for peak-to-peak interpretation",
-        xaxis=dict(title="Time (ms)", range=[start_ms, zoom_end_ms]),
-        yaxis=dict(title=dict(text="Input signal (V)", font=dict(color="blue")), tickfont=dict(color="blue")),
-        yaxis2=dict(title=dict(text="Output signal (mV)", font=dict(color="red")), tickfont=dict(color="red"), overlaying="y", side="right"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        height=520,
-        margin=dict(l=40, r=40, t=90, b=50),
-        hovermode="closest",
-    )
-    return fig
+    return tx_peak_time_s, rx_peak_time_s, "Automatic peak-to-peak interpretation: travel time is measured from the transmitted positive peak time to the highest positive point of the received signal within the default search window.", details
 
 
 
@@ -764,7 +522,7 @@ def make_peak_to_peak_plot(
     output_signal: np.ndarray,
     details: PeakToPeakDetails,
     zoom_end_ms: float,
-    manual_peak_window_ms: Optional[Tuple[float, float]] = None,
+    manual_arrival_window_ms: Optional[Tuple[float, float]] = None,
 ):
     """
     Plot the peak-to-peak interpretation using dual y-axes.
@@ -841,13 +599,15 @@ def make_peak_to_peak_plot(
     if details.input_peak_time_s is not None:
         start_ms = max(0.0, details.input_peak_time_s * 1e3 - 0.2)
 
-    if manual_peak_window_ms is not None:
-        ax1.axvspan(
-            manual_peak_window_ms[0],
-            manual_peak_window_ms[1],
-            alpha=0.15,
+    window_handle = None
+    if manual_arrival_window_ms is not None:
+        window_handle = ax1.axvspan(
+            manual_arrival_window_ms[0],
+            manual_arrival_window_ms[1],
+            alpha=0.18,
             color="gray",
-            label="Selected output-peak window",
+            label="Selected arrival window",
+            zorder=0,
         )
 
     ax1.set_xlim(start_ms, zoom_end_ms)
@@ -855,6 +615,9 @@ def make_peak_to_peak_plot(
 
     handles = [line_in, line_out] + peak_handles
     labels = ["Input signal (V)", "Output signal (mV)"] + peak_labels
+    if window_handle is not None:
+        handles.append(window_handle)
+        labels.append("Selected arrival window")
     ax1.legend(handles, labels)
 
     fig.tight_layout()
@@ -928,7 +691,7 @@ def analyze_file(
     time_unit: str,
     travel_length_mm: float,
     density_kg_m3: float,
-    selected_output_peak_time_s: Optional[float] = None,
+    manual_arrival_window_ms: Optional[Tuple[float, float]] = None,
 ) -> FileAnalysisOutput:
     df, _ = load_be_file(file_obj)
     if df.empty:
@@ -959,6 +722,10 @@ def analyze_file(
 
     results: Dict[str, AnalysisResult] = {}
 
+    manual_arrival_window_s = None
+    if manual_arrival_window_ms is not None:
+        manual_arrival_window_s = (manual_arrival_window_ms[0] * 1e-3, manual_arrival_window_ms[1] * 1e-3)
+
     tx_peak_time_s, rx_peak_time_s, note_p2p, peak_details = peak_to_peak_method(
         time_s,
         input_processed,
@@ -967,7 +734,7 @@ def analyze_file(
         search_delay_s,
         search_end_s,
         peak_prominence_ratio,
-        selected_output_peak_time_s=selected_output_peak_time_s,
+        manual_arrival_window_s=manual_arrival_window_s,
     )
     results["Peak-to-peak"] = calculate_vs_and_gmax(
         rx_peak_time_s,
@@ -1082,126 +849,27 @@ with meta2:
     density_kg_m3 = st.number_input("Bulk density ρ (kg/m³)", min_value=0.001, value=2000.0, step=10.0, format="%.3f")
 
 st.subheader("Peak-to-peak interpretation settings")
-peak_mode = st.radio(
-    "Output peak selection mode",
-    options=["Automatic highest positive peak", "Manual sliding-window selection"],
+peak_selection_mode = st.radio(
+    "Arrival peak selection for the peak-to-peak method",
+    options=["Automatic", "Manual sliding window"],
     horizontal=True,
+    help="Automatic uses the highest positive received/output peak in the default search window. Manual sliding window lets you bracket the expected first arrival peak on the received signal.",
 )
 
-manual_peak_window_ms = None
-if peak_mode == "Manual sliding-window selection":
-    st.info(
-        "Move the time-window slider to bracket the desired received/output peak. "
-        "The app will select the strongest positive local peak inside this window and use it for Vs and Gmax."
-    )
-    manual_peak_window_ms = st.slider(
-        "Select output-peak search window on the received signal (ms)",
+manual_arrival_window_ms = None
+if peak_selection_mode == "Manual sliding window":
+    manual_arrival_window_ms = st.slider(
+        "Locate the sliding window around the potential arrival peak on the received/output signal (ms)",
         min_value=0.0,
         max_value=3.0,
-        value=(0.20, 1.50),
+        value=(0.20, 1.20),
         step=0.01,
-        help="The peak-to-peak method will use the highest positive received/output peak inside this selected window.",
+        help="Move and resize this window to cover the expected arrival peak. The app will select the strongest positive local peak inside the window.",
     )
-
-selected_output_peak_time_s = None
-manual_peak_candidates_df = None
-
-if analysis_mode == "Single file":
-    st.subheader("Peak-to-peak output peak selection")
-    p2p_selection_mode = st.radio(
-        "Received/output peak used for the peak-to-peak method",
-        options=["Automatic: highest positive output peak", "Manual: click the output peak on the plot"],
-        horizontal=False,
+    st.caption(
+        "Use this option when the first arrival peak is not the maximum peak of the received signal. "
+        "After running the analysis, the selected window is shaded in the peak-to-peak plot."
     )
-
-    if p2p_selection_mode.startswith("Automatic"):
-        st.session_state.pop("clicked_output_peak_time_s", None)
-        st.session_state.pop("clicked_output_peak_value", None)
-
-    if p2p_selection_mode.startswith("Manual"):
-        try:
-            (
-                manual_peak_candidates_df,
-                candidate_time_s,
-                candidate_input_signal,
-                candidate_output_signal,
-                candidate_input_details,
-            ) = get_peak_to_peak_candidates(
-                uploaded_file,
-                time_col,
-                input_col,
-                output_col,
-                time_unit,
-            )
-
-            st.write("Click directly on the received/output peak that represents the first reliable arrival. The app will snap the click to the nearest positive output peak and use it for Vs and Gmax.")
-
-            selected_time_from_state = st.session_state.get("clicked_output_peak_time_s")
-            selected_value_from_state = st.session_state.get("clicked_output_peak_value")
-
-            if go is not None and plotly_events is not None:
-                fig_interactive = make_interactive_peak_selection_plot(
-                    candidate_time_s,
-                    candidate_input_signal,
-                    candidate_output_signal,
-                    candidate_input_details,
-                    manual_peak_candidates_df,
-                    selected_peak_time_s=selected_time_from_state,
-                    selected_peak_value=selected_value_from_state,
-                    zoom_end_ms=3.0,
-                )
-                clicked_points = plotly_events(
-                    fig_interactive,
-                    click_event=True,
-                    hover_event=False,
-                    select_event=False,
-                    override_height=540,
-                    key="peak_click_plot",
-                )
-
-                if clicked_points:
-                    clicked_time_ms = float(clicked_points[0]["x"])
-                    snapped_time_s, snapped_value, snap_note = snap_clicked_time_to_output_peak(
-                        candidate_time_s,
-                        candidate_output_signal,
-                        clicked_time_ms,
-                        candidate_input_details.input_peak_time_s,
-                    )
-                    st.session_state["clicked_output_peak_time_s"] = snapped_time_s
-                    st.session_state["clicked_output_peak_value"] = snapped_value
-                    st.success(f"Selected output peak: {snapped_time_s * 1e3:.6f} ms, amplitude = {snapped_value:.6g} ({snap_note}).")
-                    selected_output_peak_time_s = snapped_time_s
-                elif selected_time_from_state is not None:
-                    selected_output_peak_time_s = float(selected_time_from_state)
-                    st.info(f"Current selected output peak: {selected_output_peak_time_s * 1e3:.6f} ms. Click another peak to change it.")
-                else:
-                    st.info("No manual peak has been selected yet. Click on the output peak in the interactive plot, then run the analysis.")
-
-                if not manual_peak_candidates_df.empty:
-                    with st.expander("Detected output peak candidates", expanded=False):
-                        st.dataframe(manual_peak_candidates_df, use_container_width=True)
-            else:
-                st.warning(
-                    "Mouse-click peak selection requires the optional package `streamlit-plotly-events`. "
-                    "Install it with: `pip install streamlit-plotly-events`. "
-                    "Until then, use the fallback manual time input below."
-                )
-                fig_candidates = make_peak_candidate_plot(
-                    candidate_time_s,
-                    candidate_input_signal,
-                    candidate_output_signal,
-                    candidate_input_details,
-                    manual_peak_candidates_df,
-                    3.0,
-                )
-                st.pyplot(fig_candidates)
-                plt.close(fig_candidates)
-                manual_time_ms = st.number_input("Enter selected output peak time manually (ms)", min_value=0.0, value=0.0, step=0.001, format="%.6f")
-                if manual_time_ms > 0:
-                    selected_output_peak_time_s = manual_time_ms * 1e-3
-
-        except Exception as exc:
-            st.warning(f"Manual peak selection could not be prepared: {exc}")
 
 run_analysis = st.button("Run analysis", type="primary")
 if not run_analysis:
@@ -1223,7 +891,7 @@ for file_obj in file_list:
             time_unit,
             travel_length_mm,
             density_kg_m3,
-            selected_output_peak_time_s=selected_output_peak_time_s if analysis_mode == "Single file" else None,
+            manual_arrival_window_ms=manual_arrival_window_ms,
         )
 
         results_df = analysis_output.results_df.copy()
@@ -1243,7 +911,7 @@ for file_obj in file_list:
             analysis_output.output_processed,
             analysis_output.peak_details,
             3.0,
-        manual_peak_window_ms=manual_peak_window_ms,
+            manual_arrival_window_ms=manual_arrival_window_ms,
         )
         plot_files[f"{safe_stem}_peak_to_peak.png"] = fig_to_png_bytes(fig_peak)
         plt.close(fig_peak)
@@ -1291,7 +959,7 @@ if analysis_mode == "Single file":
             single_output.output_processed,
             single_output.peak_details,
             3.0,
-        manual_peak_window_ms=manual_peak_window_ms,
+            manual_arrival_window_ms=manual_arrival_window_ms,
         )
         st.pyplot(fig_peak_display)
         peak_plot_bytes = fig_to_png_bytes(fig_peak_display)
@@ -1318,8 +986,8 @@ else:
                     analysis_output.output_processed,
                     analysis_output.peak_details,
                     3.0,
-                manual_peak_window_ms=manual_peak_window_ms,
-        )
+                    manual_arrival_window_ms=manual_arrival_window_ms,
+                )
                 st.pyplot(fig_peak_display)
                 plt.close(fig_peak_display)
             with batch_col2:
