@@ -1,8 +1,9 @@
 streamlit
-plotly
-streamlit-plotly-events
 numpy
 pandas
 matplotlib
 scipy
 openpyxl
+xlrd
+plotly
+streamlit-plotly-events
